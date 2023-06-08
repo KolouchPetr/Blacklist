@@ -4,6 +4,7 @@ import os
 from io import StringIO
 import io
 import tarfile
+import zipfile
 import gzip
 from dotenv import load_dotenv
 import os
@@ -56,7 +57,38 @@ def download_csv(url):
 
 def download_txt(url):
     try:
+        lines = []
         response = requests.get(url, headers=HEADERS)
+        response.raise_for_status()
+
+        content_type = response.headers.get("Content-Type")
+        content_disposition = response.headers.get("Content-Disposition")
+        if content_disposition and "filename=" in content_disposition:
+            filename = content_disposition.split("filename=")[-1].strip('\"')
+        else:
+            filename = "my_file"
+        
+        if "text/html" in content_type or "text/plain" in content_type:
+            stream = io.StringIO(response.text)
+            for line in stream:
+                lines.append(line.strip())
+        else:
+            if filename.endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(response.content)) as zip_ref:
+                    for name in zip_ref.namelist():
+                        with zip_ref.open(name) as f:
+                            for line in io.TextIOWrapper(f):
+                                lines.append(line.strip())
+
+            elif filename.endswith("tar.gz"):
+                with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:gz") as tar_ref:
+                    for member in tar_ref.getmembers():
+                        if member.isfile():
+                            f = tar_ref.extractfile(member)
+                            if f:
+                                for line in io.TextIOWrapper(f):
+                                    lines.append(line.strip())
+                
         lines = response.text.splitlines()
         return lines
     except (requests.HTTPError, requests.ConnectionError, requests.Timeout):
@@ -76,6 +108,16 @@ def download_gz(url):
                 files_lines.extend(lines)  # extend instead of append
         return files_lines
 
+def download_zip(url):
+    lines = []
+    response = requests.get(url, headers=HEADERS)
+    with zipfile.ZipFile(io.BytesIO(response.content)) as zip_ref:
+        for name in zip_ref.namelist():
+            with zip_ref.open(name) as f:
+                for line in io.TextIOWrapper(f):
+                    lines.append(line.strip())
+    return lines
+
 
 def insertTXT(TXT, cur, conn):
     try:
@@ -89,9 +131,12 @@ def insertTXT(TXT, cur, conn):
             if domain is None:
                 continue
 
+            domain = re.sub(r"www\.", "", domain)
+
             cur.execute(f"INSERT INTO domain_ip_pairs VALUES ('{domain}') ON CONFLICT DO NOTHING")
             conn.commit()
     except Exception as e:
+        print(f"{WARNING_COLOR}[ERROR] error inserting domain {domain}")
         print(f"{WARNING_COLOR}[Error] in insertTXT: {e}")
 
 
@@ -109,10 +154,13 @@ def insertCSV(CSV, cur, conn):
 
                     if domain is None:
                         continue
+
+                    domain = re.sub(r"www\.", "", domain)
                 
                     cur.execute(f"INSERT INTO domain_ip_pairs VALUES ('{domain}') ON CONFLICT DO NOTHING")
                     conn.commit()
     except Exception as e:
+        print(f"{WARNING_COLOR}[ERROR] error inserting domain {domain}")
         print(f"{WARNING_COLOR}[ERROR] in insertCSV :{e}")
 
 
@@ -147,8 +195,14 @@ def main():
             if lines is not None:
                 for line in lines:
                     TXT.append(line)
+        elif ext == ".zip":
+            print(f"[INFO] downloading .zip from {url}")
+            lines = download_zip(url)
+            if lines is not None:
+                for line in lines:
+                    TXT.append(line)
         else:
-            print(f"[INFO] downloading txt from {url}")
+            print(f"[INFO] downloading from {url}")
             lines = download_txt(url)
             if lines is not None:
                 for line in lines:
