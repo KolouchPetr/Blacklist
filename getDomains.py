@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 import os
 import re
 import psycopg2
+import socket
 
 load_dotenv()
 
@@ -18,6 +19,7 @@ DOMAIN_REGEX = r'\b(?:(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+(?:[A
 IP_REGEX = r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b|\b(?:[A-Fa-f0-9]{1,4}:){7}[A-Fa-f0-9]{1,4}\b"
 
 URL_FILE = "sources.txt"
+IGNORED_IPS = ["0.0.0.0", "localhost", "127.0.0.1", "255.255.255.255"]
 
 
 working_urls = []
@@ -119,49 +121,62 @@ def download_zip(url):
     return lines
 
 
-def insertTXT(TXT, cur, conn):
-    try:
-        for line in TXT:
-            domain_matches = re.findall(DOMAIN_REGEX, line, re.IGNORECASE)
-            # ip_matches = re.findall(IP_REGEX, line)
+def insertTxtDomainToDB(TXT, cur, conn):
+    for line in TXT:
+        domain_matches = re.findall(DOMAIN_REGEX, line, re.IGNORECASE)
+        ip_matches = re.findall(IP_REGEX, line)
+        
+        insertIntoDB(domain_matches, ip_matches, cur, conn)
 
-            domain = domain_matches[0] if domain_matches else None
-            # ip = ip_matches[0] if ip_matches else None
-
-            if domain is None:
-                continue
-
-            domain = re.sub(r"www\.", "", domain)
-
-            cur.execute(f"INSERT INTO domain_ip_pairs VALUES ('{domain}') ON CONFLICT DO NOTHING")
-            conn.commit()
-    except Exception as e:
-        print(f"{WARNING_COLOR}[ERROR] error inserting domain {domain}")
-        print(f"{WARNING_COLOR}[Error] in insertTXT: {e}")
-
-
-def insertCSV(CSV, cur, conn):
-    try:
+def insertCsvDomainToDb(CSV, cur, conn):
         for df in CSV:
             for _, row in df.iterrows():
                 for col in df.columns:
                     line = str(row[col])
                     domain_matches = re.findall(DOMAIN_REGEX, line, re.IGNORECASE)
-                    # ip_matches = re.findall(IP_REGEX, line)
+                    ip_matches = re.findall(IP_REGEX, line)
+                    insertIntoDB(domain_matches, ip_matches, cur, conn)
 
-                    domain = domain_matches[0] if domain_matches else None
-                    # ip = ip_matches[0] if ip_matches else None
+#todo multiple ips or domains??
+def resolveHosts(domain, ip):
+    domain_name = domain
+    ip_addr = ip
 
-                    if domain is None:
-                        continue
+    if domain is None and ip is not None:
+        try:
+            domain_name = socket.gethostbyaddr(ip)[0] if domain_name else domain
+        except Exception:
+            domain_name = domain
+    elif ip is None and domain is not None:
+        try:
+            ip_addr = socket.gethostbyname(domain)
+        except Exception:
+            ip_addr = ip
 
-                    domain = re.sub(r"www\.", "", domain)
-                
-                    cur.execute(f"INSERT INTO domain_ip_pairs VALUES ('{domain}') ON CONFLICT DO NOTHING")
-                    conn.commit()
-    except Exception as e:
-        print(f"{WARNING_COLOR}[ERROR] error inserting domain {domain}")
-        print(f"{WARNING_COLOR}[ERROR] in insertCSV :{e}")
+    return domain_name, ip_addr
+
+
+def insertIntoDB(domain_matches, ip_matches, cur, conn):
+    domain = domain_matches[0] if domain_matches else None
+    ip = ip_matches[0] if ip_matches else None
+
+    if ip in IGNORED_IPS:
+        ip = None
+
+    domain, ip = resolveHosts(domain, ip)
+
+    if domain is None and ip is not None:
+        cur.execute(f"INSERT INTO ip_new VALUES ('{ip}') ON CONFLICT DO NOTHING")
+    
+    elif domain is not None:
+        if domain.startswith("www."):
+            domain = domain[4:]
+        try:
+            cur.execute(f"INSERT INTO domains_new VALUES ('{domain}', '{ip}') ON CONFLICT DO NOTHING")
+            conn.commit()
+        except Exception as e:
+        # print(f"{WARNING_COLOR}[ERROR] error inserting domain {domain}")
+            print(f"{WARNING_COLOR}[Error] in insertTxtDomainToDB: {e}")
 
 
 def load_google_sheet(sheet_id = os.environ["SHEET_ID"], sheet_name = "Blacklists"):
@@ -217,13 +232,14 @@ def main():
                 )
         cur = conn.cursor()
 
-        cur.execute("CREATE TABLE IF NOT EXISTS domain_ip_pairs (domain VARCHAR(255) UNIQUE)")
+        cur.execute("CREATE TABLE IF NOT EXISTS domains_new (domain VARCHAR(255) UNIQUE, ip VARCHAR(1024) UNIQUE)")
+        cur.execute("CREATE TABLE IF NOT EXISTS ip_new (ip VARCHAR(1024) UNIQUE)")
         conn.commit()
 
-        insertTXT(TXT, cur, conn)
-        insertCSV(CSV, cur, conn)
+        insertTxtDomainToDB(TXT, cur, conn)
+        insertCsvDomainToDb(CSV, cur, conn)
     except Exception as e:
-        print(f"{WARNING_COLOR}[ERROR] an error occured while connecting to the database: {e}")
+        print(f"{WARNING_COLOR}[ERROR]{e}")
         exit(1)
 
     cur.close()
