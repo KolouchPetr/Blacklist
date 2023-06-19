@@ -13,6 +13,7 @@ import psycopg2
 import socket
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
+import gc
 
 load_dotenv()
 
@@ -27,12 +28,12 @@ IP_REGEX = r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4
 URL_FILE = "sources.txt"
 # ips to ignore from host files
 IGNORED_IPS = ["0.0.0.0", "localhost", "127.0.0.1", "255.255.255.255"]
+WHITELIST = {"255.255.255.255", "localhost.localdomain"} # prevents the script from inserting nonsense, feel free to add more
 # HTTP header for request
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
 }
-#number of workers for threading
-MAX_WORKERS = 100
+MAX_WORKERS = 50
 
 # list for working blacklist sources
 working_urls = []
@@ -41,21 +42,8 @@ working_urls = []
 CSV = []
 TXT = []
 
-# dictionary for domains with performed DNS resolve
-resolve_domains = {}
-# dictionary for domains not in the database with performed DNS resolve
-resolve_domains_new = {}
-resolve_ips = []
-# list of domains without ip
-noIpsDomains = []
-# list of ips without a domain
-noDomainIps = []
-
-#locks
-resolve_domains_lock = Lock()
-resolve_domains_new_lock = Lock()
-resolve_ips_lock = Lock()
-
+domainsForLookup = set()
+ipsForLookup = set()
 
 """
     check_url checks whether a connection to an url is available
@@ -189,12 +177,12 @@ def download_zip(url):
     @param con database connection
 
 """
-def findInformationTxt(TXT, cur, conn):
-    print("[INFO] searching for matches in TXT")
-    for line in TXT:
-        domain_matches = re.findall(DOMAIN_REGEX, line, re.IGNORECASE)
-        ip_matches = re.findall(IP_REGEX, line)
-        insertIntoDB(domain_matches, ip_matches, cur, conn)
+def findInformationTxt(lines, source):
+    for line in lines:
+        if not line.startswith("#") and not line.startswith(";") and not line.startswith("//"): 
+            domain_matches = re.findall(DOMAIN_REGEX, line, re.IGNORECASE)
+            ip_matches = re.findall(IP_REGEX, line)
+            insertIntoDB(domain_matches, ip_matches, source)
 
 """
    findInformationCsv searches for domains and ips in lines from the downloaded .csv files
@@ -204,15 +192,14 @@ def findInformationTxt(TXT, cur, conn):
     @param con database connection
 
 """
-def findInformationCsv(CSV, cur, conn):
-    print("[INFO] searching for matches in CSV")
-    for df in CSV:
+def findInformationCsv(df, source):
         for _, row in df.iterrows():
             for col in df.columns:
                 line = str(row[col])
-                domain_matches = re.findall(DOMAIN_REGEX, line, re.IGNORECASE)
-                ip_matches = re.findall(IP_REGEX, line)
-                insertIntoDB(domain_matches, ip_matches, cur, conn)
+                if not line.startswith("#") and not line.startswith(";") and not line.startswith("//"): 
+                    domain_matches = re.findall(DOMAIN_REGEX, line, re.IGNORECASE)
+                    ip_matches = re.findall(IP_REGEX, line)
+                    insertIntoDB(domain_matches, ip_matches, source)
 
 """
     resolveIp tries to retrieve a domain from an ip address
@@ -220,23 +207,28 @@ def findInformationCsv(CSV, cur, conn):
     @param ip ip address 
 
 """
-def resolveIp(ip):
+def getHostnameFromIp(ip):
+    ipsDomains = {}
     try:
-        print(f"[INFO] trying to resolve ip: {ip}")
-        retrieved_domain = socket.gethostbyaddr(ip)[0]
-        domain_name = retrieved_domain if retrieved_domain else None
-        if domain_name:
-            # with resolve_domains_lock:
-                if domain_name in resolve_domains:
-                    resolve_domains[domain_name].append(ip)
-                else:
-                    resolve_domains[domain_name] = [ip]
-        else:
-            # with resolve_ips_lock:
-                resolve_ips.append(ip)
+        retrieved_domains = socket.gethostbyaddr(ip)[0]
+        ipsDomains[ip] = retrieved_domains
     except Exception as e:
-            print(f"{WARNING_COLOR} [ERROR] an error has occured while resolving domain for IP: {e}")
-            pass
+        ipsDomains[ip] = []
+    return ipsDomains
+
+def updateIpsDomains():
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        results = list(pool.map(getHostnameFromIp, ipsForLookup))
+
+    ipsDomains = {}
+    for dic in results:
+        ipsDomains.update(dic)
+
+    for ip, domain in ipsDomains.items():
+        print(f"[INFO] inserting resolved {ip} with domain {domain}")
+        sql = "INSERT INTO domains_new VALUES(%s, %s, 'Resolve') ON CONFLICT DO NOTHING"
+        cur.execute(sql, (domain, [ip]))
+        conn.commit()
 
 
 """
@@ -246,66 +238,32 @@ def resolveIp(ip):
 
 """
 # TODO: once in a while insert it into database, this is not memory efficient
-def resolveDomain(domain):
+def getIpFromHostname(domain):
+    domainIps = {}
+
     try:
-       print(f"[INFO] trying to resolve domain: {domain}")
        info = socket.getaddrinfo(domain, None)
        retrieved_ips = [item[4][0] for item in info]
-       ips = [retrieved_ips] if retrieved_ips else []
-       if ips:
-           # with resolve_domains_lock:
-            if domain in resolve_domains:
-                resolve_domains[domain].extend(ips)
-       else:
-           # with resolve_domains_new_lock:
-                resolve_domains_new[domain] = ips
+       domainIps[domain] = retrieved_ips
     except Exception as e:
-        print(f"{WARNING_COLOR} [ERROR] an error has occured while resolving IP for a domain: {e}")
-        pass
+        domainIps[domain] = []
 
-"""
-    resolveDomains executes resolveDomain using threading
-
-    @param domains domains
-
-"""
-def resolveDomains(domains):
-    print(f"[INFO] resolving domains of size {len(domains)}")
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        executor.map(resolveDomain, domains) 
-
-"""
-    resolveIps executes resolveIp using threading
-
-    @param ips ip addresses 
-
-"""
-def resolveIps(ips):
-    print(f"[INFO] resolving ips of size {len(ips)}")
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        executor.map(resolveIp, ips)
+    return domainIps
 
 
-"""
-    updateByResolved updates and inserts data collected by DNS resolve to the database
+def updateDomainsIps():
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        results = list(pool.map(getIpFromHostname, domainsForLookup))
 
-    @param cur database cursor
-    @param conn database connection
+    domainIps = {}
+    for dic in results:
+        domainIps.update(dic)
 
-"""
-def updateByResolved(cur, conn):
-    resolveDomains(noIpsDomains)
-    resolveIps(noDomainIps)
-
-    for domain in resolve_domains:
-        cur.execute(f"UPDATE domains_new SET ip = {resolve_domains[domain]} WHERE domain = '{domain}'")
-    for domain in resolve_domains_new:
-        cur.execute(f"INSERT INTO domains_new VALUES ('{domain}', {resolve_domains_new[domain]})")
-    for ip in resolve_ips:
-        cur.execute(f"INSERT INTO ip_new VALUES ('{ip}')")
-
-    conn.commit()
-
+    for domain, ip in domainIps.items():
+        print(f"[INFO] updating {domain} with {ip}")
+        sql = ("UPDATE domains_new SET ip = %s WHERE domain = %s")
+        cur.execute(sql, (ip, domain))
+        conn.commit()
 
 """
     insertIntoDb inserts domains and ips without using DNS resolve to the database
@@ -317,7 +275,7 @@ def updateByResolved(cur, conn):
 
 """
 #TODO: check if flow
-def insertIntoDB(domain_matches, ip_matches, cur, conn):
+def insertIntoDB(domain_matches, ip_matches, source):
     domain = domain_matches[0] if domain_matches else None
     ip = ip_matches[0] if ip_matches else None
 
@@ -328,22 +286,27 @@ def insertIntoDB(domain_matches, ip_matches, cur, conn):
         if domain.startswith("www."):
             domain = domain[4:]
 
-    if domain is None and ip is not None:
-        noDomainIps.append(ip)
-        cur.execute(f"INSERT INTO ip_new VALUES ('{ip}') ON CONFLICT DO NOTHING")
-
-    if domain is not None and ip is None:
-        noIpsDomains.append(domain)
-        
-    elif domain is not None:
+    if domain is not None and ip is not None:
         try:
-            cur.execute(f"INSERT INTO domains_new VALUES ('{domain}', ARRAY['{ip}']) ON CONFLICT DO NOTHING")
+            cur.execute(f"INSERT INTO domains_new VALUES ('{domain}', ARRAY['{ip}'], '{source}') ON CONFLICT DO NOTHING")
             conn.commit()
         except Exception as e:
-        # print(f"{WARNING_COLOR}[ERROR] error inserting domain {domain}")
-            print(f"{WARNING_COLOR}[Error] in findInformationTxt: {e}")
-
-
+            print(f"{WARNING_COLOR}[Error] {e}")
+    
+    elif domain is not None and ip is None:
+        domainsForLookup.add(domain)
+        try:
+            cur.execute(f"INSERT INTO domains_new VALUES ('{domain}', ARRAY['{ip}'], '{source}') ON CONFLICT DO NOTHING")
+            conn.commit()
+        except Exception as e:
+            print(f"{WARNING_COLOR}[Error] {e}")
+    elif domain is None and ip is not None:
+        ipsForLookup.add(ip)
+        try:
+            cur.execute(f"INSERT INTO ip_new VALUES (ARRAY['{ip}'], '{source}') ON CONFLICT DO NOTHING")
+            conn.commit()
+        except Exception as e:
+            print(f"{WARNING_COLOR}[Error] {e}")
 """
     load_google_sheet loads urls from provided google spreadsheet
 
@@ -353,20 +316,50 @@ def insertIntoDB(domain_matches, ip_matches, cur, conn):
 """
 def load_google_sheet(sheet_id = os.environ["SHEET_ID"], sheet_name = "Blacklists"):
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+    print(url)
     df = pd.read_csv(url, encoding="utf-8")
     urls = df["link"]
     return urls
 
+def yieldCurrentLines():
+    for url in working_urls:
+            _, ext = os.path.splitext(url)
+            if ext == ".csv":
+                print(f"[INFO] downloading csv from {url}")
+                df = download_csv(url)
+                if df is not None:
+                    yield df, url, "CSV"
+            elif ext == ".gz":
+                print(f"[INFO] downloading .gz from {url}")
+                lines = download_gz(url)
+                if lines is not None:
+                    yield lines, url, "TXT"
+            elif ext == ".zip":
+                print(f"[INFO] downloading .zip from {url}")
+                lines = download_zip(url)
+                if lines is not None:
+                        yield lines, url, "TXT"
+            else:
+                print(f"[INFO] downloading from {url}")
+                lines = download_txt(url)
+                if lines is not None:
+                        yield lines, url, "TXT"
 
 def main():
+    global cur
+    global conn
     
     print("[INFO] loading google sheet")
-    load_google_sheet()
 
     sheet_urls = load_google_sheet()
     
     print("[INFO] checking sources for availability")
     for url in sheet_urls:
+        #TODO: 
+        if url == "em_th":
+            pass
+        if url == "mal_doms":
+            pass
         if check_url(url):
            working_urls.append(url)
 
@@ -375,53 +368,28 @@ def main():
         for url in working_urls:
             f.write(f"{url}\n")
 
-    for url in working_urls:
-        _, ext = os.path.splitext(url)
-        if ext == ".csv":
-            print(f"[INFO] downloading csv from {url}")
-            df = download_csv(url)
-            if df is not None:
-                CSV.append(df)
-        elif ext == ".gz":
-            print(f"[INFO] downloading .gz from {url}")
-            lines = download_gz(url)
-            if lines is not None:
-                for line in lines:
-                    TXT.append(line)
-        elif ext == ".zip":
-            print(f"[INFO] downloading .zip from {url}")
-            lines = download_zip(url)
-            if lines is not None:
-                for line in lines:
-                    TXT.append(line)
-        else:
-            print(f"[INFO] downloading from {url}")
-            lines = download_txt(url)
-            if lines is not None:
-                for line in lines:
-                    TXT.append(line)
+    print("[INFO] conneting to the database")
+    conn = psycopg2.connect(
+            host= os.environ["HOST"],
+            user = os.environ["USER"],
+            database = os.environ["DATABASE"],
+            password = os.environ["PASSWORD"]
+            )
+    cur = conn.cursor()
 
-    try:
-        print("[INFO] conneting to the database")
-        conn = psycopg2.connect(
-                host= os.environ["HOST"],
-                user = os.environ["USER"],
-                database = os.environ["DATABASE"],
-                password = os.environ["PASSWORD"]
-                )
-        cur = conn.cursor()
+    print("[INFO] accessing database tables")
+    cur.execute("CREATE TABLE IF NOT EXISTS domains_new (domain VARCHAR(255) UNIQUE, ip VARCHAR(1024)[], source VARCHAR(1024))")
+    cur.execute("CREATE TABLE IF NOT EXISTS ip_new (ip VARCHAR(1024) UNIQUE, source VARCHAR(1024))")
+    conn.commit()
 
-        print("[INFO] accessing database tables")
-        cur.execute("CREATE TABLE IF NOT EXISTS domains_new (domain VARCHAR(255) UNIQUE, ip VARCHAR(1024)[])")
-        cur.execute("CREATE TABLE IF NOT EXISTS ip_new (ip VARCHAR(1024) UNIQUE)")
-        conn.commit()
+    for lines, source_url, source_type in yieldCurrentLines():
+        if source_type == "CSV":
+            findInformationCsv(lines, source_url)
+        elif source_type == "TXT":
+            findInformationTxt(lines, source_url)
 
-        findInformationTxt(TXT, cur, conn)
-        findInformationCsv(CSV, cur, conn)
-        updateByResolved(cur, conn)
-    except Exception as e:
-        print(f"{WARNING_COLOR}[ERROR]{e}")
-        exit(1)
+    updateDomainsIps()
+    updateIpsDomains()
 
     cur.close()
     conn.close()
