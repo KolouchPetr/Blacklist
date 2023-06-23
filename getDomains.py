@@ -33,7 +33,7 @@ WHITELIST = {"255.255.255.255", "localhost.localdomain"} # prevents the script f
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
 }
-MAX_WORKERS = 50
+MAX_WORKERS = 200
 
 # list for working blacklist sources
 working_urls = []
@@ -212,6 +212,8 @@ def getHostnameFromIp(ip):
     try:
         retrieved_domains = socket.gethostbyaddr(ip)[0]
         ipsDomains[ip] = retrieved_domains
+        if not retrieved_domains:
+            ipsDomains[ip] = []
     except Exception as e:
         ipsDomains[ip] = []
     return ipsDomains
@@ -226,8 +228,8 @@ def updateIpsDomains():
 
     for ip, domain in ipsDomains.items():
         print(f"[INFO] inserting resolved {ip} with domain {domain}")
-        sql = "INSERT INTO domains_new VALUES(%s, %s, 'Resolve') ON CONFLICT DO NOTHING"
-        cur.execute(sql, (domain, [ip]))
+        sql = "INSERT INTO domains_new VALUES(%s, %s, (SELECT source_id FROM domains_new WHERE domain=%s)) ON CONFLICT DO NOTHING"
+        cur.execute(sql, (domain, [ip], domain))
         conn.commit()
 
 
@@ -288,7 +290,7 @@ def insertIntoDB(domain_matches, ip_matches, source):
 
     if domain is not None and ip is not None:
         try:
-            cur.execute(f"INSERT INTO domains_new VALUES ('{domain}', ARRAY['{ip}'], '{source}') ON CONFLICT DO NOTHING")
+            cur.execute(f"INSERT INTO domains_new VALUES ('{domain}', ARRAY['{ip}'], (SELECT source_id FROM sources_new WHERE source='{source}' LIMIT 1)) ON CONFLICT DO NOTHING")
             conn.commit()
         except Exception as e:
             print(f"{WARNING_COLOR}[Error] {e}")
@@ -296,14 +298,14 @@ def insertIntoDB(domain_matches, ip_matches, source):
     elif domain is not None and ip is None:
         domainsForLookup.add(domain)
         try:
-            cur.execute(f"INSERT INTO domains_new VALUES ('{domain}', ARRAY['{ip}'], '{source}') ON CONFLICT DO NOTHING")
+            cur.execute(f"INSERT INTO domains_new VALUES ('{domain}', ARRAY['{ip}'], (SELECT source_id FROM sources_new WHERE source='{source}' LIMIT 1)) ON CONFLICT DO NOTHING")
             conn.commit()
         except Exception as e:
             print(f"{WARNING_COLOR}[Error] {e}")
     elif domain is None and ip is not None:
         ipsForLookup.add(ip)
         try:
-            cur.execute(f"INSERT INTO ip_new VALUES (ARRAY['{ip}'], '{source}') ON CONFLICT DO NOTHING")
+            cur.execute(f"INSERT INTO ip_new VALUES (ARRAY['{ip}'], (SELECT source_id FROM sources_new WHERE source='{source}' LIMIT 1)) ON CONFLICT DO NOTHING")
             conn.commit()
         except Exception as e:
             print(f"{WARNING_COLOR}[Error] {e}")
@@ -378,11 +380,14 @@ def main():
     cur = conn.cursor()
 
     print("[INFO] accessing database tables")
-    cur.execute("CREATE TABLE IF NOT EXISTS domains_new (domain VARCHAR(255) UNIQUE, ip VARCHAR(1024)[], source VARCHAR(1024))")
-    cur.execute("CREATE TABLE IF NOT EXISTS ip_new (ip VARCHAR(1024) UNIQUE, source VARCHAR(1024))")
+    cur.execute("CREATE TABLE IF NOT EXISTS sources_new (source_id INT GENERATED ALWAYS AS IDENTITY, source VARCHAR(1024), PRIMARY KEY(source_id))")
+    cur.execute("CREATE TABLE IF NOT EXISTS domains_new (domain VARCHAR(255) UNIQUE, ip VARCHAR(1024)[], source_id INT, CONSTRAINT fk_source FOREIGN KEY(source_id) REFERENCES sources_new(source_id))")
+    cur.execute("CREATE TABLE IF NOT EXISTS ip_new (ip VARCHAR(1024) UNIQUE, source_id INT, CONSTRAINT fk_source FOREIGN KEY(source_id) REFERENCES sources_new(source_id))")
     conn.commit()
 
     for lines, source_url, source_type in yieldCurrentLines():
+        cur.execute(f"INSERT INTO sources_new(source) VALUES('{source_url}') ON CONFLICT DO NOTHING")
+        conn.commit()
         if source_type == "CSV":
             findInformationCsv(lines, source_url)
         elif source_type == "TXT":
